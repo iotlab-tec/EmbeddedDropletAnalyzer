@@ -1,6 +1,6 @@
 {
   "title": "Modular On-Chip Droplet Sensor System — Design Files and Firmware",
-  "description": "Open-source hardware design files and firmware for a modular, on-chip sensor system for flow and monodispersity analysis in droplet-based microfluidics. Includes PCB Gerbers and drill files for three sensor boards (optical flow sensor, LED board, velocity sensor), 3-D STEP/STL exports for all mechanical parts, and microcontroller firmware for both sensor subsystems. Companion to a manuscript submitted to HardwareX.",
+  "description": "Open-source hardware design files and firmware for a modular, on-chip sensor system for flow and monodispersity analysis in droplet-based microfluidics. Includes PCB Gerbers and drill files for three sensor boards (optical flow sensor, LED board, velocity sensor), 3-D STEP/STL exports for all mechanical parts, and microcontroller firmware for both sensor subsystems. Companion to a manuscript submitted to HardwareX. Hardware design files and firmware are licensed under CERN-OHL-S v2; documentation is licensed under CC-BY-SA-4.0.",
   "upload_type": "other",
   "license": "CERN-OHL-S-2.0",
   "keywords": [
