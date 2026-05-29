@@ -1,200 +1,142 @@
+// Velocity Sensor — Arduino Zero firmware.
+//
+// Times a droplet's transit between two optical comparator sensors (COMP_A and
+// COMP_B) separated by a known distance and reports velocity in mm/s over Serial.
+// The time-of-flight state machine lives in VelSensor.{h,cpp}; this file is the
+// hardware glue: pin setup, the two digital-potentiometer comparator thresholds,
+// the rising-edge ISRs, and the main loop. All tunable values are in Config.h.
+
 #include <Arduino.h>
 #include <Wire.h>
-#include "wiring_private.h"
-#include "velSensor.h"
-#include "velSensor.c"
-// Clean version Win
+#include "wiring_private.h"   // pinPeripheral() for the second SERCOM I²C bus
+#include "Config.h"
+#include "VelSensor.h"
 
-// NOTE: Second I2C port: SDA 11; SCL 13;
-//  Seting second I2C port to use pins 11 and 13
-#define digiPot 0x2F // I2C address of the digital potentiometers
-TwoWire myWire(&sercom1, 11, 13);
+using namespace Config;
 
-// NOTE: I/O pins of new Arduino Shield:
-const uint8_t LED_R = 9;
-const uint8_t LED_G = 8;
-const uint8_t LED_Y = 12;
-const uint8_t LED_B = A5;
-const uint8_t LED_VEL = 10; // Light source for Vel Sensor
-const uint8_t LED_OFS = A4; // Light source for OFS TSL2561
-const uint8_t button1 = 2;  // Button 1
-const uint8_t button2 = 3;  // Button 2
-const uint8_t button3 = 5;  // Button 3
+// Second I²C bus for DigiPot 2 (DigiPot 1 shares address 0x2F on the default bus).
+TwoWire myWire(&sercom1, PIN_SDA2, PIN_SCL2);
 
-// NOTE: Velocity Sensor Comparator output pins:
+VelSensor sensor;
 
-const uint8_t comp_s1 = 7; // COMP_A
-const uint8_t comp_s2 = 6; // COMP_B
+// Shared state written by the ISRs and consumed by the main loop.
+volatile unsigned long lastTriggerTime_s1 = 0;  // last raw S1 edge time (debounce)
+volatile unsigned long lastTriggerTime_s2 = 0;  // last raw S2 edge time (debounce)
+volatile unsigned long lastValidS1Time    = 0;  // last accepted S1 edge time
+volatile unsigned long lastValidS2Time    = 0;  // last accepted S2 edge time
 
-// Globals
-volatile unsigned long lastTriggerTime_s1 = 0; // Last trigger time for Sensor 1
-volatile unsigned long lastTriggerTime_s2 = 0; // Last trigger time for Sensor 2
-volatile unsigned long lastValidS1Time = 0;    // Timestamp of last accepted ISR1
-volatile unsigned long lastValidS2Time = 0;    // Timestamp of last accepted ISR2
+volatile uint32_t Time = 0;       // timestamp (µs) of the most recent accepted edge
+volatile bool     fs1  = false;   // Sensor 1 edge flag
+volatile bool     fs2  = false;   // Sensor 2 edge flag
 
-// Debounce timing constants
-const unsigned long DEBOUNCE_TIME_US = 1000; // 1ms debounce for high-speed droplets
-const unsigned long MIN_INTER_S1_US = 3000;   // Ignore S1 edges <3ms after previous valid S1
-const unsigned long MIN_INTER_S2_US = 3000;   // Ignore S2 edges <3ms after previous valid S2
+float prevVel = 0.0f;
 
-// NOTE: Digipots Wiper values:
-// CONFIG: W1 -> DigiPot1 -> COMP_1 -> Sensor 2 (Second sensor contacted to the droplet)
-// CONFIG: W2 -> DigiPot2 -> COMP_2 -> Sensor 1 (First sensor contacted to the droplet)
-// CONFIG: n -> Number of droplets to reset timer 2.
-
-const uint8_t WIPER1 = 76; // RED
-const uint8_t WIPER2 = 83; // GREEN
-const uint8_t n = 2;       // Number of sensors (1 or 2)
-
-// NOTE: SCADE init variables
-inC_velSensor inC;
-outC_velSensor outC;
-kcg_uint32 Time = 0;
-kcg_bool fs1 = false;
-kcg_bool fs2 = false;
-float prevVel;
-
-void isr_1()
-{
-  // Interrupt for COMP_A (Sensor 1 - First sensor contacted by droplet)
-  unsigned long currentTime = micros();
-  unsigned long elapsedTime = currentTime - lastTriggerTime_s1;
-
-  // Improved debouncing and per-sensor inter-event guard
-  if (elapsedTime > DEBOUNCE_TIME_US && (currentTime - lastValidS1Time) > MIN_INTER_S1_US && digitalRead(comp_s1) == HIGH)
-  {
-    lastTriggerTime_s1 = currentTime;
-    lastValidS1Time = currentTime;
-    fs1 = true;     // Set SCADE input flag
-
-    // Lightweight ISR: capture timestamp and signal main loop to process SCADE
-    Time = currentTime;     // Capture timestamp associated with this event
-  }
+// Interrupt for COMP_A (Sensor 1 — first sensor contacted by the droplet).
+void isr_1() {
+    unsigned long now = micros();
+    if ((now - lastTriggerTime_s1) > DEBOUNCE_TIME_US &&
+        (now - lastValidS1Time) > MIN_INTER_S1_US &&
+        digitalRead(PIN_COMP_S1) == HIGH) {
+        lastTriggerTime_s1 = now;
+        lastValidS1Time    = now;
+        fs1  = true;
+        Time = now;
+    }
 }
 
-void isr_2()
-{
-  // Interrupt for COMP_B (Sensor 2 - Second sensor contacted by droplet)
-  unsigned long currentTime = micros();
-  unsigned long elapsedTime = currentTime - lastTriggerTime_s2;
-
-  // Improved debouncing and per-sensor inter-event guard
-  if (elapsedTime > DEBOUNCE_TIME_US && (currentTime - lastValidS2Time) > MIN_INTER_S2_US && digitalRead(comp_s2) == HIGH)
-  {
-    lastTriggerTime_s2 = currentTime;
-    lastValidS2Time = currentTime;
-    fs2 = true;     // Set SCADE input flag
-
-    // Lightweight ISR: capture timestamp and signal main loop to process SCADE
-    Time = currentTime;     // Capture timestamp associated with this event
-  }
+// Interrupt for COMP_B (Sensor 2 — second sensor contacted by the droplet).
+void isr_2() {
+    unsigned long now = micros();
+    if ((now - lastTriggerTime_s2) > DEBOUNCE_TIME_US &&
+        (now - lastValidS2Time) > MIN_INTER_S2_US &&
+        digitalRead(PIN_COMP_S2) == HIGH) {
+        lastTriggerTime_s2 = now;
+        lastValidS2Time    = now;
+        fs2  = true;
+        Time = now;
+    }
 }
 
-void setWiper(TwoWire &bus, uint8_t value)
-{
-  // Set the wiper value for the digital potentiometer
-  bus.beginTransmission(digiPot);
-  bus.write(value); // Set the wiper value
-  bus.endTransmission();
+// Push a wiper value to a digital potentiometer at DIGIPOT_ADDR on the given bus.
+void setWiper(TwoWire &bus, uint8_t value) {
+    bus.beginTransmission(DIGIPOT_ADDR);
+    bus.write(value);
+    bus.endTransmission();
 }
 
-void setupPins()
-{
-  // Set pin modes for all I/O pins
-  pinMode(comp_s1, INPUT);        // Comparator output for Sensor 1
-  pinMode(comp_s2, INPUT);        // Comparator output for Sensor 2
-  pinMode(LED_VEL, OUTPUT);       // Velocity sensor LED
-  pinMode(LED_B, OUTPUT);         // Blue LED indicator
-  pinMode(LED_Y, OUTPUT);         // Yellow LED indicator
-  pinMode(LED_R, OUTPUT);         // Red LED indicator
-  pinMode(LED_G, OUTPUT);         // Green LED indicator
-  pinMode(LED_OFS, OUTPUT);       // OFS TSL2561 LED
-  pinMode(button1, INPUT_PULLUP); // Button 1 with pullup
-  pinMode(button2, INPUT_PULLUP); // Button 2 with pullup
-  pinMode(button3, INPUT_PULLUP); // Button 3 with pullup
+void setupPins() {
+    pinMode(PIN_COMP_S1, INPUT);
+    pinMode(PIN_COMP_S2, INPUT);
+    pinMode(PIN_LED_VEL, OUTPUT);
+    pinMode(PIN_LED_B, OUTPUT);
+    pinMode(PIN_LED_Y, OUTPUT);
+    pinMode(PIN_LED_R, OUTPUT);
+    pinMode(PIN_LED_G, OUTPUT);
+    pinMode(PIN_LED_OFS, OUTPUT);
+    pinMode(PIN_B1, INPUT_PULLUP);
+    pinMode(PIN_B2, INPUT_PULLUP);
+    pinMode(PIN_B3, INPUT_PULLUP);
 
-  // Initialize LED states
-  digitalWrite(LED_VEL, HIGH); // Turn on velocity sensor LED
-  digitalWrite(LED_B, LOW);    // Turn off other LEDs initially
-  digitalWrite(LED_Y, LOW);
-  digitalWrite(LED_R, LOW);
-  digitalWrite(LED_G, LOW);
-  digitalWrite(LED_OFS, LOW);
+    digitalWrite(PIN_LED_VEL, HIGH);  // velocity-sensor light source on
+    digitalWrite(PIN_LED_B, LOW);
+    digitalWrite(PIN_LED_Y, LOW);
+    digitalWrite(PIN_LED_R, LOW);
+    digitalWrite(PIN_LED_G, LOW);
+    digitalWrite(PIN_LED_OFS, LOW);
 }
 
-void setup()
-{
-  // SCADE function initialization
-  velSensor_init(&outC); // Initialize SCADE function
-  // Initialize I2C
-  Wire.begin();                  // Initialize I2C
-  myWire.begin();                // Initialize second I2C port
-  pinPeripheral(11, PIO_SERCOM); // Set pin 11 to SERCOM mode
-  pinPeripheral(13, PIO_SERCOM); // Set pin 13 to SERCOM mode
+void setup() {
+    sensor.init(N_S2_EDGES, D_MM);
 
-  // Initialize serial communication
-  Serial.begin(38400);
-  Serial.println(">>> Optical Droplet Velocity Sensor [OFS 3.0] <<<");
-  delay(10);
+    // Bring up both I²C buses just long enough to push the wiper thresholds,
+    // then release them — the buses are not used again after boot.
+    Wire.begin();
+    myWire.begin();
+    pinPeripheral(PIN_SDA2, PIO_SERCOM);
+    pinPeripheral(PIN_SCL2, PIO_SERCOM);
 
-  // Set digiPot wiper values
-  setWiper(Wire, WIPER1);   // Set wiper value for DigiPot1
-  setWiper(myWire, WIPER2); // Set wiper value for DigiPot2
-  myWire.end();
-  Wire.end();
+    Serial.begin(SERIAL_BAUD);
+    Serial.println(">>> Optical Droplet Velocity Sensor <<<");
+    delay(10);
 
-  // Set up all pin modes and initial states
-  setupPins();
+    setWiper(Wire, WIPER1);
+    setWiper(myWire, WIPER2);
+    myWire.end();
+    Wire.end();
 
-  // Set up interrupts
-  attachInterrupt(digitalPinToInterrupt(comp_s1), isr_1, RISING); // Attach interrupt for COMP_A
-  attachInterrupt(digitalPinToInterrupt(comp_s2), isr_2, RISING); // Attach interrupt for COMP_B
+    setupPins();
 
-  inC.n = n; // Set input count for Sensor 2
+    attachInterrupt(digitalPinToInterrupt(PIN_COMP_S1), isr_1, RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_COMP_S2), isr_2, RISING);
 
-  // Print initial message
-  Serial.print("Digital Potentiometer 1: ");
-  Serial.println(WIPER1);
-  Serial.print("Digital Potentiometer 2: ");
-  Serial.println(WIPER2);
-  Serial.print("n: ");
-  Serial.println(inC.n);
-  Serial.println("=== Velocity Measurements with ISR Debug ===");
-  Serial.println("Format: Vel: [velocity] mm/s, ISR1 calls: [count], ISR2 calls: [count], n: [counter], startTime: [us], stopTime: [us], timeDiff: [us]");
-  Serial.println("DEBUG format: TimerInit, TimerStop, Counter_s2, ISR1 total, ISR2 total, fs1, fs2");
-  Serial.println("ISR Debug: ISR1/ISR2 with count, Time, timer states, and timing values");
-  delay(1000);
+    Serial.print("Digital Potentiometer 1: ");
+    Serial.println(WIPER1);
+    Serial.print("Digital Potentiometer 2: ");
+    Serial.println(WIPER2);
+    Serial.print("n: ");
+    Serial.println(N_S2_EDGES);
+    Serial.println("=== Velocity (mm/s), one value per detected droplet ===");
+    delay(1000);
 }
 
-void loop()
-{
-  // Update LED indicators based on SCADE outputs
-  digitalWrite(LED_B, outC.timerInit);
-  digitalWrite(LED_Y, outC.timerStop);
+void loop() {
+    // LED indicators track the timer state.
+    digitalWrite(PIN_LED_B, sensor.timerInit);
+    digitalWrite(PIN_LED_Y, sensor.timerStop);
 
-  // Process SCADE in main loop when flags are set (no debug prints)
-  if (fs1 || fs2)
-  {
-    velSensor(&inC, &outC);
-  }
+    // Advance the state machine when an ISR has latched an edge. Snapshot the
+    // volatile inputs once so they cannot change mid-cycle.
+    if (fs1 || fs2) {
+        sensor.step(fs1, fs2, Time);
+    }
 
-  // Print velocity only if it changed and is valid
-  if (outC.vel != prevVel && outC.vel > 0.0)
-  {
-    Serial.println(outC.vel);
-    prevVel = outC.vel;
-  }
+    // Print only completed measurements, and only when the value changes.
+    if (sensor.vel != prevVel && sensor.vel > 0.0f) {
+        Serial.println(sensor.vel);
+        prevVel = sensor.vel;
+    }
 
-  // No periodic debug to keep serial line quiet
-
-  // Reset sensor flags in main loop (safer than in ISR)
-  // This prevents potential race conditions
-  if (fs1 == true)
-  {
-    fs1 = false;     // Reset SCADE flag for Sensor 1
-  }
-  if (fs2 == true)
-  {
-    fs2 = false;     // Reset SCADE flag for Sensor 2
-  }
+    // Clear the edge flags here (not in the ISR) to avoid a race.
+    fs1 = false;
+    fs2 = false;
 }
